@@ -4,6 +4,7 @@ __pycache__/
 .env
 *.pdf
 *.md
+!README.md
 *.sql
 *.log
 .DS_Store
