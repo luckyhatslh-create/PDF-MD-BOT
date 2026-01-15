@@ -1,0 +1,27 @@
+# PDF-MD-Supabase Bot Requirements
+
+# Telegram Bot
+python-telegram-bot>=21.0
+
+# PDF Processing
+pdfplumber>=0.10.0
+pypdf>=4.0.0
+pymupdf>=1.24.0  # Улучшенная экстракция, поддержка кириллицы, изображения
+
+# Image Processing
+Pillow>=10.0.0
+
+# OCR Support (requires system Tesseract: brew install tesseract tesseract-lang)
+pytesseract>=0.3.10
+pdf2image>=1.16.0
+
+# Supabase
+supabase>=2.0.0
+
+# Embeddings & Vision AI
+openai>=1.0.0  # Для эмбеддингов и Vision API (анализ изображений)
+# anthropic>=0.20.0  # Альтернативный Vision API (опционально)
+# sentence-transformers>=2.0.0  # Для локальных эмбеддингов (опционально)
+
+# Utilities
+python-dotenv>=1.0.0

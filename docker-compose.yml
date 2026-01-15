@@ -1,0 +1,55 @@
+# PDF-MD-Supabase Bot - Docker Compose
+#
+# Быстрый старт:
+#   1. Скопируйте .env.example в .env и заполните значения
+#   2. docker-compose up -d
+#
+# Просмотр логов:
+#   docker-compose logs -f bot
+
+version: "3.8"
+
+services:
+  bot:
+    build: .
+    container_name: pdf-md-bot
+    restart: unless-stopped
+
+    # Переменные окружения из .env файла
+    env_file:
+      - .env
+
+    # Дополнительные переменные (можно переопределить в .env)
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TEMP_DIR=/tmp/pdf_processor
+      # OCR по умолчанию ВЫКЛЮЧЕН (для экономии ресурсов)
+      # Установите ENABLE_OCR=true в .env для включения
+      - ENABLE_OCR=${ENABLE_OCR:-false}
+      - OCR_LANGUAGES=${OCR_LANGUAGES:-rus+eng}
+      # Vision AI по умолчанию ВЫКЛЮЧЕН (требует OpenAI ключ)
+      - ANALYZE_IMAGES=${ANALYZE_IMAGES:-false}
+      - VISION_PROVIDER=${VISION_PROVIDER:-openai}
+
+    # Лимиты ресурсов (опционально)
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+    # Том для временных файлов (опционально, для отладки)
+    volumes:
+      - pdf_temp:/tmp/pdf_processor
+
+    # Логирование
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pdf_temp:
+    driver: local
