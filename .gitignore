@@ -5,6 +5,7 @@ __pycache__/
 *.pdf
 *.md
 !README.md
+!deploy_guide.md
 *.sql
 *.log
 .DS_Store
