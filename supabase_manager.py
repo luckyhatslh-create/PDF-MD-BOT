@@ -154,6 +154,155 @@ CREATE TRIGGER documents_updated_at
 """
 
 
+# SQL миграция для управления документами
+MIGRATION_DOCUMENT_MANAGEMENT = """
+-- MIGRATION: Document management enhancements
+
+-- Добавить новые поля в таблицу documents
+ALTER TABLE documents
+ADD COLUMN IF NOT EXISTS user_custom_title TEXT,
+ADD COLUMN IF NOT EXISTS processing_profile TEXT DEFAULT 'universal',
+ADD COLUMN IF NOT EXISTS user_id BIGINT,  -- Telegram user ID
+ADD COLUMN IF NOT EXISTS tags TEXT[],     -- Теги для поиска
+ADD COLUMN IF NOT EXISTS description TEXT;
+
+-- Индексы для быстрого поиска
+CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id);
+CREATE INDEX IF NOT EXISTS idx_documents_profile ON documents(processing_profile);
+CREATE INDEX IF NOT EXISTS idx_documents_tags ON documents USING GIN(tags);
+CREATE INDEX IF NOT EXISTS idx_documents_custom_title ON documents
+    USING GIN(to_tsvector('russian', COALESCE(user_custom_title, '')));
+
+-- Функция для поиска по пользователю с фильтрами
+CREATE OR REPLACE FUNCTION search_user_documents(
+    p_user_id BIGINT,
+    p_search_query TEXT DEFAULT NULL,
+    p_profile TEXT DEFAULT NULL,
+    p_date_from TIMESTAMPTZ DEFAULT NULL,
+    p_date_to TIMESTAMPTZ DEFAULT NULL,
+    p_limit INT DEFAULT 20,
+    p_offset INT DEFAULT 0
+)
+RETURNS TABLE (
+    id UUID,
+    title TEXT,
+    user_custom_title TEXT,
+    author TEXT,
+    page_count INTEGER,
+    processing_profile TEXT,
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    tags TEXT[],
+    match_rank REAL
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        d.id,
+        d.title,
+        d.user_custom_title,
+        d.author,
+        d.page_count,
+        d.processing_profile,
+        d.created_at,
+        d.updated_at,
+        d.tags,
+        CASE
+            WHEN p_search_query IS NOT NULL THEN
+                ts_rank(
+                    to_tsvector('russian', COALESCE(d.user_custom_title, d.title)),
+                    plainto_tsquery('russian', p_search_query)
+                )
+            ELSE 0.0
+        END AS match_rank
+    FROM documents d
+    WHERE
+        (p_user_id IS NULL OR d.user_id = p_user_id)
+        AND (p_profile IS NULL OR d.processing_profile = p_profile)
+        AND (p_date_from IS NULL OR d.created_at >= p_date_from)
+        AND (p_date_to IS NULL OR d.created_at <= p_date_to)
+        AND (
+            p_search_query IS NULL OR
+            to_tsvector('russian', COALESCE(d.user_custom_title, d.title))
+            @@ plainto_tsquery('russian', p_search_query)
+        )
+    ORDER BY
+        CASE WHEN p_search_query IS NOT NULL THEN match_rank ELSE 0.0 END DESC,
+        d.created_at DESC
+    LIMIT p_limit
+    OFFSET p_offset;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Обновить функцию match_documents для поддержки фильтрации по пользователю
+CREATE OR REPLACE FUNCTION match_documents(
+    query_embedding vector(1536),
+    match_threshold float DEFAULT 0.7,
+    match_count int DEFAULT 10,
+    filter_document_id uuid DEFAULT NULL,
+    filter_user_id BIGINT DEFAULT NULL
+)
+RETURNS TABLE (
+    id uuid,
+    document_id uuid,
+    content text,
+    heading text,
+    page_number int,
+    similarity float,
+    metadata jsonb
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        dc.id,
+        dc.document_id,
+        dc.content,
+        dc.heading,
+        dc.page_number,
+        1 - (dc.embedding <=> query_embedding) as similarity,
+        dc.metadata
+    FROM document_chunks dc
+    JOIN documents d ON dc.document_id = d.id
+    WHERE
+        (filter_document_id IS NULL OR dc.document_id = filter_document_id)
+        AND (filter_user_id IS NULL OR d.user_id = filter_user_id)
+        AND 1 - (dc.embedding <=> query_embedding) > match_threshold
+    ORDER BY dc.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$;
+
+-- ======================================================================
+-- KEEPALIVE: Предотвращение паузы Supabase Free Tier
+-- ======================================================================
+
+-- Таблица для keepalive пингов
+CREATE TABLE IF NOT EXISTS keepalive_pings (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    source TEXT DEFAULT 'telegram_bot',
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+-- Индекс для быстрого удаления старых записей
+CREATE INDEX IF NOT EXISTS idx_keepalive_timestamp ON keepalive_pings(timestamp DESC);
+
+-- Функция автоочистки старых записей (>30 дней)
+CREATE OR REPLACE FUNCTION cleanup_old_keepalive_pings()
+RETURNS void AS $$
+BEGIN
+    DELETE FROM keepalive_pings
+    WHERE timestamp < NOW() - INTERVAL '30 days';
+END;
+$$ LANGUAGE plpgsql;
+
+-- Комментарий для документации
+COMMENT ON TABLE keepalive_pings IS 'Keepalive пинги для предотвращения паузы Supabase Free Tier (7 дней неактивности)';
+"""
+
+
 class SupabaseManager:
     """Менеджер для работы с Supabase"""
     
@@ -171,17 +320,25 @@ class SupabaseManager:
         self.client: Client = create_client(url, key)
         
     def upload_document(
-        self, 
+        self,
         parsed_doc: ParsedDocument,
-        embeddings: Optional[list[list[float]]] = None
+        embeddings: Optional[list[list[float]]] = None,
+        user_id: Optional[int] = None,
+        custom_title: Optional[str] = None,
+        processing_profile: Optional[str] = None,
+        tags: Optional[list[str]] = None
     ) -> str:
         """
         Загрузка документа в Supabase
-        
+
         Args:
             parsed_doc: Распарсенный документ
             embeddings: Опционально - готовые эмбеддинги для чанков
-            
+            user_id: Telegram user ID
+            custom_title: Пользовательское название документа
+            processing_profile: Профиль обработки (fiction, technical, diagrams, universal)
+            tags: Теги для поиска
+
         Returns:
             ID документа в БД
         """
@@ -208,8 +365,15 @@ class SupabaseManager:
             'file_hash': content_hash,
             'metadata': {
                 'toc': parsed_doc.table_of_contents[:50],  # Первые 50 пунктов
-                'subject': parsed_doc.metadata.subject
-            }
+                'subject': parsed_doc.metadata.subject,
+                'has_images': parsed_doc.metadata.has_images,
+                'is_scanned': parsed_doc.metadata.is_scanned,
+                'quality_metrics': parsed_doc.quality_metrics
+            },
+            'user_id': user_id,
+            'user_custom_title': custom_title,
+            'processing_profile': processing_profile or 'universal',
+            'tags': tags or []
         }
         
         result = self.client.table('documents').insert(doc_data).execute()
@@ -246,17 +410,19 @@ class SupabaseManager:
         query_embedding: list[float],
         threshold: float = 0.7,
         limit: int = 10,
-        document_id: Optional[str] = None
+        document_id: Optional[str] = None,
+        user_id: Optional[int] = None
     ) -> list[dict]:
         """
         Семантический поиск по документам
-        
+
         Args:
             query_embedding: Вектор запроса
             threshold: Минимальный порог схожести
             limit: Максимум результатов
             document_id: Опционально - поиск в конкретном документе
-            
+            user_id: Опционально - поиск только в документах пользователя
+
         Returns:
             Список найденных чанков
         """
@@ -266,7 +432,8 @@ class SupabaseManager:
                 'query_embedding': query_embedding,
                 'match_threshold': threshold,
                 'match_count': limit,
-                'filter_document_id': document_id
+                'filter_document_id': document_id,
+                'filter_user_id': user_id
             }
         ).execute()
         
@@ -318,10 +485,107 @@ class SupabaseManager:
             print(f"Ошибка удаления: {e}")
             return False
 
+    def rename_document(self, document_id: str, new_title: str) -> bool:
+        """Переименование документа"""
+        try:
+            self.client.table('documents').update({
+                'user_custom_title': new_title,
+                'updated_at': datetime.now().isoformat()
+            }).eq('id', document_id).execute()
+            return True
+        except Exception as e:
+            print(f"Ошибка переименования: {e}")
+            return False
+
+    def search_user_documents(
+        self,
+        user_id: Optional[int] = None,
+        search_query: Optional[str] = None,
+        profile: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0
+    ) -> list[dict]:
+        """Поиск документов пользователя с фильтрами"""
+        result = self.client.rpc('search_user_documents', {
+            'p_user_id': user_id,
+            'p_search_query': search_query,
+            'p_profile': profile,
+            'p_date_from': date_from,
+            'p_date_to': date_to,
+            'p_limit': limit,
+            'p_offset': offset
+        }).execute()
+
+        return result.data
+
+    def get_user_documents_count(self, user_id: int) -> int:
+        """Количество документов пользователя"""
+        result = self.client.table('documents').select(
+            'id', count='exact'
+        ).eq('user_id', user_id).execute()
+
+        return result.count if result.count else 0
+
+    def ping_keepalive(self) -> dict:
+        """
+        Keepalive пинг для предотвращения паузы Supabase Free Tier
+
+        Вставляет запись в keepalive_pings таблицу каждые 3 дня.
+        Supabase Free Tier засыпает после 7 дней неактивности.
+
+        Returns:
+            dict: {
+                'success': bool,
+                'timestamp': str,
+                'ping_id': str,
+                'error': str (если success=False)
+            }
+        """
+        try:
+            # INSERT запрос - минимальная активность БД
+            result = self.client.table('keepalive_pings').insert({
+                'source': 'telegram_bot',
+                'metadata': {
+                    'bot_version': '2.0',
+                    'keepalive_interval_days': 3
+                }
+            }).execute()
+
+            ping_id = result.data[0]['id']
+            timestamp = result.data[0]['timestamp']
+
+            # Опционально: очистка старых записей (>30 дней)
+            try:
+                self.client.rpc('cleanup_old_keepalive_pings').execute()
+            except Exception as cleanup_err:
+                # Не критично если cleanup не сработал
+                print(f"Warning: cleanup failed: {cleanup_err}")
+
+            return {
+                'success': True,
+                'timestamp': timestamp,
+                'ping_id': ping_id
+            }
+
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'timestamp': None,
+                'ping_id': None
+            }
+
 
 def generate_setup_sql() -> str:
     """Возвращает SQL для настройки базы данных"""
     return SETUP_SQL
+
+
+def generate_migration_sql() -> str:
+    """Возвращает SQL миграции для управления документами"""
+    return MIGRATION_DOCUMENT_MANAGEMENT
 
 
 def create_sql_migration_file(

@@ -17,10 +17,11 @@ from pathlib import Path
 from enum import Enum, auto
 from dataclasses import dataclass
 from typing import Optional
+from datetime import datetime
 
 from telegram import (
-    Update, 
-    InlineKeyboardButton, 
+    Update,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     Document
 )
@@ -33,7 +34,7 @@ from telegram.ext import (
     filters
 )
 
-from config import config
+from config import config, KEEPALIVE_INTERVAL_DAYS, KEEPALIVE_ADMIN_USER_ID, KEEPALIVE_LOG_FILE
 from pdf_parser import parse_pdf_to_markdown, ParsedDocument
 from supabase_manager import (
     SupabaseManager, 
@@ -47,6 +48,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Константы keepalive для предотвращения паузы Supabase Free Tier
+KEEPALIVE_INTERVAL_SECONDS = KEEPALIVE_INTERVAL_DAYS * 24 * 60 * 60  # 3 дня = 259200 сек
 
 
 class OutputMode(Enum):
@@ -95,6 +99,21 @@ def get_confirm_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def get_profile_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора профиля обработки"""
+    keyboard = []
+
+    for profile_id, profile in config.PROCESSING_PROFILES.items():
+        keyboard.append([
+            InlineKeyboardButton(
+                text=profile["name"],
+                callback_data=f"profile_{profile_id}"
+            )
+        ])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
 # Команды
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
@@ -135,6 +154,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /list - Список документов в Supabase
 /search <запрос> - Поиск по документам
 /setup - SQL для настройки Supabase
+/keepalive_status - Статус keepalive системы
+/keepalive_test - Тест keepalive (только админ)
 
 **Форматы вывода:**
 
@@ -422,6 +443,191 @@ async def upload_to_supabase(query, session: UserSession):
         await query.edit_message_text(f"❌ Ошибка загрузки: {e}")
 
 
+async def keepalive_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статус keepalive системы"""
+    try:
+        manager = SupabaseManager(config.SUPABASE_URL, config.SUPABASE_KEY)
+
+        # Получить последние 5 пингов
+        result = manager.client.table('keepalive_pings').select(
+            'id, timestamp, source'
+        ).order('timestamp', desc=True).limit(5).execute()
+
+        if not result.data:
+            await update.message.reply_text(
+                "⚠️ Keepalive пинги не найдены\n\n"
+                "Возможно миграция не применена или бот только запустился."
+            )
+            return
+
+        # Форматировать статус
+        pings = result.data
+        last_ping = pings[0]
+        last_timestamp = datetime.fromisoformat(last_ping['timestamp'].replace('Z', '+00:00'))
+
+        # Вычислить время до следующего пинга
+        next_ping_time = last_timestamp.timestamp() + KEEPALIVE_INTERVAL_SECONDS
+        now = datetime.now().timestamp()
+        hours_until_next = (next_ping_time - now) / 3600
+
+        # Проверка здоровья
+        days_since_last = (datetime.now().timestamp() - last_timestamp.timestamp()) / 86400
+
+        if days_since_last > 7:
+            status = "🚨 КРИТИЧНО: БД могла заснуть!"
+        elif days_since_last > 5:
+            status = "⚠️ ВНИМАНИЕ: Близко к лимиту"
+        elif days_since_last > 3:
+            status = "⏰ Просрочен следующий ping"
+        else:
+            status = "✅ Работает нормально"
+
+        text = (
+            f"📊 Статус Keepalive\n\n"
+            f"{status}\n\n"
+            f"📅 Последний ping:\n"
+            f"  {last_timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"  ({days_since_last:.1f} дней назад)\n\n"
+            f"⏭️ Следующий ping через:\n"
+            f"  {hours_until_next:.1f} часов\n\n"
+            f"📈 История (последние 5):\n"
+        )
+
+        for i, ping in enumerate(pings, 1):
+            ts = datetime.fromisoformat(ping['timestamp'].replace('Z', '+00:00'))
+            text += f"  {i}. {ts.strftime('%Y-%m-%d %H:%M')}\n"
+
+        text += f"\n⚙️ Интервал: {KEEPALIVE_INTERVAL_DAYS} дней"
+
+        await update.message.reply_text(text)
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Ошибка проверки статуса:\n{str(e)}"
+        )
+
+
+async def keepalive_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительный тест keepalive (только для админа)"""
+    user_id = update.effective_user.id
+
+    # Проверка прав админа
+    if KEEPALIVE_ADMIN_USER_ID and user_id != KEEPALIVE_ADMIN_USER_ID:
+        await update.message.reply_text("❌ Доступ запрещён. Только для администратора.")
+        return
+
+    await update.message.reply_text("🔄 Выполняю тестовый keepalive ping...")
+
+    try:
+        manager = SupabaseManager(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
+        result = manager.ping_keepalive()
+
+        if result['success']:
+            await update.message.reply_text(
+                f"✅ Тестовый ping успешен!\n\n"
+                f"Ping ID: {result['ping_id']}\n"
+                f"Timestamp: {result['timestamp']}\n\n"
+                f"Система keepalive работает корректно."
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Тестовый ping провалился!\n\n"
+                f"Ошибка: {result['error']}\n\n"
+                f"Проверьте конфигурацию и SQL миграцию."
+            )
+    except Exception as e:
+        await update.message.reply_text(
+            f"💥 Исключение при тесте:\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def keepalive_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Периодический keepalive пинг в Supabase
+
+    Запускается каждые 3 дня через JobQueue.
+    Предотвращает засыпание Supabase Free Tier (7 дней неактивности).
+    """
+    timestamp = datetime.now().isoformat()
+
+    try:
+        # Выполнить ping
+        manager = SupabaseManager(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
+        result = manager.ping_keepalive()
+
+        if result['success']:
+            # Успешный ping
+            log_message = (
+                f"[{timestamp}] ✅ Keepalive ping successful\n"
+                f"  Ping ID: {result['ping_id']}\n"
+                f"  Timestamp: {result['timestamp']}\n"
+                f"  Next ping in {KEEPALIVE_INTERVAL_DAYS} days\n"
+            )
+
+            logger.info(log_message)
+
+            # Записать в файл
+            with open(KEEPALIVE_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(log_message + "\n")
+
+            # Опционально: уведомить админа (тихо, без спама)
+            if KEEPALIVE_ADMIN_USER_ID:
+                await context.bot.send_message(
+                    chat_id=KEEPALIVE_ADMIN_USER_ID,
+                    text=f"✅ Keepalive: БД активна\nСледующий ping через {KEEPALIVE_INTERVAL_DAYS} дня"
+                )
+        else:
+            # Ошибка ping
+            error_message = (
+                f"[{timestamp}] ❌ Keepalive ping FAILED\n"
+                f"  Error: {result['error']}\n"
+                f"  ⚠️ БД может заснуть если не исправить!\n"
+            )
+
+            logger.error(error_message)
+
+            # Записать в файл
+            with open(KEEPALIVE_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(error_message + "\n")
+
+            # КРИТИЧНО: уведомить админа о сбое
+            if KEEPALIVE_ADMIN_USER_ID:
+                await context.bot.send_message(
+                    chat_id=KEEPALIVE_ADMIN_USER_ID,
+                    text=(
+                        "🚨 КРИТИЧНО: Keepalive ping FAILED!\n\n"
+                        f"Ошибка: {result['error']}\n\n"
+                        "БД может заснуть через 7 дней если не исправить.\n"
+                        "Проверьте:\n"
+                        "1. SUPABASE_URL и SUPABASE_SERVICE_KEY в .env\n"
+                        "2. Применена ли SQL миграция (keepalive_pings таблица)\n"
+                        "3. Работает ли интернет на сервере"
+                    )
+                )
+
+    except Exception as e:
+        # Критическая ошибка (исключение)
+        exception_message = (
+            f"[{timestamp}] 💥 EXCEPTION in keepalive_job\n"
+            f"  Exception: {type(e).__name__}: {str(e)}\n"
+        )
+
+        logger.exception(exception_message)
+
+        with open(KEEPALIVE_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(exception_message + "\n")
+
+        if KEEPALIVE_ADMIN_USER_ID:
+            await context.bot.send_message(
+                chat_id=KEEPALIVE_ADMIN_USER_ID,
+                text=(
+                    f"💥 КРИТИЧЕСКАЯ ОШИБКА в keepalive_job!\n\n"
+                    f"{type(e).__name__}: {str(e)}\n\n"
+                    "Проверьте логи бота."
+                )
+            )
+
+
 def main():
     """Запуск бота"""
     if not config.TELEGRAM_BOT_TOKEN:
@@ -432,13 +638,27 @@ def main():
     
     # Создаем приложение
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
-    
+
+    # ============ KEEPALIVE JOB ============
+    # Запуск keepalive задачи каждые 3 дня
+    # Первый запуск через 10 секунд после старта
+    app.job_queue.run_repeating(
+        callback=keepalive_job,
+        interval=KEEPALIVE_INTERVAL_SECONDS,  # 3 дня = 259200 сек
+        first=10,  # Первый запуск через 10 сек (для проверки работоспособности)
+        name='supabase_keepalive'
+    )
+    logger.info(f"✅ Keepalive job зарегистрирован: интервал = {KEEPALIVE_INTERVAL_DAYS} дней")
+    # ========================================
+
     # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("setup", setup_command))
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("keepalive_status", keepalive_status_command))
+    app.add_handler(CommandHandler("keepalive_test", keepalive_test_command))
     
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(handle_callback))

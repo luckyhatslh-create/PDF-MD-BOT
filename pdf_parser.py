@@ -73,6 +73,7 @@ class ParsedDocument:
     table_of_contents: list[str]
     images: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    quality_metrics: dict = field(default_factory=dict)
 
 
 class HeadingTracker:
@@ -100,9 +101,10 @@ class HeadingTracker:
 class ImageAnalyzer:
     """Анализ изображений через Vision API"""
 
-    def __init__(self, provider: str = "openai", api_key: str = None):
+    def __init__(self, provider: str = "openai", api_key: str = None, focus: str = None):
         self.provider = provider
         self.api_key = api_key
+        self.focus = focus
         self._client = None
 
     @property
@@ -140,6 +142,12 @@ class ImageAnalyzer:
 - Перечисли пронумерованные/подписанные части
 
 Отвечай на русском языке. Контекст документа: """ + context
+
+        # Добавить focus если указан
+        if self.focus == "formulas":
+            prompt += "\n\nФОКУС: Обрати особое внимание на математические формулы и уравнения."
+        elif self.focus == "diagrams":
+            prompt += "\n\nФОКУС: Обрати особое внимание на схемы, диаграммы и технические чертежи."
 
         try:
             response = self.client.chat.completions.create(
@@ -187,7 +195,9 @@ class PDFParser:
         ocr_languages: str = 'rus+eng',
         analyze_images: bool = False,
         vision_provider: str = 'openai',
-        vision_api_key: str = None
+        vision_api_key: str = None,
+        extract_tables: bool = True,
+        vision_focus: str = None
     ):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -197,6 +207,8 @@ class PDFParser:
         self.analyze_images = analyze_images
         self.vision_provider = vision_provider
         self.vision_api_key = vision_api_key
+        self.extract_tables = extract_tables
+        self.vision_focus = vision_focus
 
         # Внутренние объекты
         self._heading_tracker = HeadingTracker()
@@ -207,7 +219,8 @@ class PDFParser:
         if analyze_images:
             self._image_analyzer = ImageAnalyzer(
                 provider=vision_provider,
-                api_key=vision_api_key
+                api_key=vision_api_key,
+                focus=vision_focus
             )
         
     def parse(self, pdf_path: str) -> ParsedDocument:
@@ -256,13 +269,31 @@ class PDFParser:
         # Разбиваем на чанки
         chunks = self._create_chunks(pages_content, metadata)
 
+        # Рассчитываем метрики качества
+        tables_detected = sum(len(p.get('tables', [])) for p in pages_content)
+        tables_rejected = len([w for w in self._warnings if 'Rejected broken table' in w])
+        garbage_lines_filtered = len([w for w in self._warnings if 'Filtered garbage' in w])
+        duplicate_tables_skipped = len([w for w in self._warnings if 'Skipped duplicate table' in w])
+
+        total_tables = tables_detected + tables_rejected
+        broken_table_rate = tables_rejected / total_tables if total_tables > 0 else 0.0
+
+        quality_metrics = {
+            'tables_detected': tables_detected,
+            'tables_rejected': tables_rejected,
+            'garbage_lines_filtered': garbage_lines_filtered,
+            'duplicate_tables_skipped': duplicate_tables_skipped,
+            'broken_table_rate': broken_table_rate,
+        }
+
         return ParsedDocument(
             metadata=metadata,
             full_markdown=full_md,
             chunks=chunks,
             table_of_contents=toc,
             images=images,
-            warnings=self._warnings
+            warnings=self._warnings,
+            quality_metrics=quality_metrics
         )
     
     def _extract_metadata(self, pdf_path: Path) -> PDFMetadata:
@@ -381,6 +412,11 @@ class PDFParser:
                     current = []
                 continue
 
+            # Фильтруем мусорные строки
+            if self._is_garbage_line(line):
+                self._warnings.append(f"Filtered garbage line: {line[:50]}")
+                continue
+
             # Проверяем, продолжение ли это предыдущей строки
             if current:
                 prev = current[-1]
@@ -413,10 +449,16 @@ class PDFParser:
 
     def _extract_tables_with_strategies(self, page) -> list:
         """Извлечение таблиц с несколькими стратегиями"""
+        # Если extract_tables=False, вернуть пустой список
+        if not self.extract_tables:
+            return []
+
         # Стратегия 1: Стандартные настройки
         tables = page.extract_tables()
         if tables and any(not self._is_empty_table(t) for t in tables):
-            return [t for t in tables if not self._is_empty_table(t)]
+            valid_tables = self._filter_valid_tables(tables, page.page_number)
+            if valid_tables:
+                return valid_tables
 
         # Стратегия 2: Строгие линии
         try:
@@ -426,7 +468,9 @@ class PDFParser:
                 "snap_tolerance": 5,
             })
             if tables and any(not self._is_empty_table(t) for t in tables):
-                return [t for t in tables if not self._is_empty_table(t)]
+                valid_tables = self._filter_valid_tables(tables, page.page_number)
+                if valid_tables:
+                    return valid_tables
         except Exception:
             pass
 
@@ -438,11 +482,31 @@ class PDFParser:
                 "min_words_vertical": 3,
             })
             if tables and any(not self._is_empty_table(t) for t in tables):
-                return [t for t in tables if not self._is_empty_table(t)]
+                valid_tables = self._filter_valid_tables(tables, page.page_number)
+                if valid_tables:
+                    return valid_tables
         except Exception:
             pass
 
         return []
+
+    def _filter_valid_tables(self, tables: list, page_number: int) -> list:
+        """Фильтрует валидные таблицы, отклоняя пустые и сломанные"""
+        valid_tables = []
+        for table in tables:
+            if self._is_empty_table(table):
+                continue
+
+            is_broken, reason = self._is_broken_table(table)
+            if is_broken:
+                self._warnings.append(
+                    f"Rejected broken table on page {page_number}: {reason}"
+                )
+                continue
+
+            valid_tables.append(table)
+
+        return valid_tables
 
     def _is_empty_table(self, table: list) -> bool:
         """Проверяет, является ли таблица пустой"""
@@ -454,6 +518,64 @@ class PDFParser:
             for cell in row
         )
         return total_content < 10
+
+    def _is_broken_table(self, table: list) -> tuple[bool, str]:
+        """
+        Детектирует сломанные/ложные таблицы с помощью нескольких эвристик.
+
+        Returns:
+            (is_broken: bool, reason: str) - True если таблица должна быть отклонена
+        """
+        if not table or len(table) < 2:
+            return True, "too_few_rows"
+
+        # Собираем все непустые ячейки
+        all_cells = []
+        for row in table:
+            for cell in row:
+                cell_text = str(cell or '').strip()
+                if cell_text:
+                    all_cells.append(cell_text)
+
+        if len(all_cells) < 3:
+            return True, "too_few_cells"
+
+        # МЕТРИКА 1: Детектирование фрагментации (>50% ячеек содержат 1-2 символа)
+        # Только очень короткие фрагменты (1-2 символа), не полные слова
+        fragments = sum(1 for c in all_cells if len(c) <= 2)
+        fragment_ratio = fragments / len(all_cells)
+
+        if fragment_ratio > 0.5:
+            return True, f"high_fragmentation_{fragment_ratio:.0%}"
+
+        # МЕТРИКА 2: Непостоянное количество столбцов (дисперсия >50%)
+        col_counts = [len([c for c in row if str(c or '').strip()]) for row in table]
+        if col_counts:
+            avg_cols = sum(col_counts) / len(col_counts)
+            variance = sum(abs(c - avg_cols) for c in col_counts) / len(col_counts)
+            if variance > avg_cols * 0.5 and avg_cols > 0:
+                return True, f"inconsistent_columns_var_{variance:.1f}"
+
+        # МЕТРИКА 3: Детектирование разрыва слов
+        # Проверяем, не содержат ли ячейки части составных слов
+        split_words = 0
+        for i, cell in enumerate(all_cells[:-1]):
+            # Если текущая ячейка заканчивается на середине слова, а следующая начинается с середины
+            if len(cell) <= 4 and cell.isalpha():
+                next_cell = all_cells[i + 1]
+                if next_cell and len(next_cell) > 0 and next_cell[0].islower():
+                    split_words += 1
+
+        if split_words > len(all_cells) * 0.2:
+            return True, f"split_words_{split_words}/{len(all_cells)}"
+
+        # МЕТРИКА 4: Детектирование фрагментов предложений
+        # Если ячейки содержат фрагменты предложений с обычной пунктуацией
+        sentence_chars = sum(1 for c in all_cells if any(p in c for p in [',', '.', ':', ';']))
+        if sentence_chars > len(all_cells) * 0.4 and fragment_ratio > 0.2:
+            return True, "sentence_fragmentation"
+
+        return False, "ok"
 
     def _detect_headers_smart(self, page) -> list[dict]:
         """Умное определение заголовков: по шрифту или паттернам"""
@@ -532,11 +654,24 @@ class PDFParser:
         if not text:
             return False
 
+        # Исключаем элементы нумерованного списка
+        # Список: "1. Текст здесь..." (начинается с предложения, заканчивается пунктуацией)
+        # Заголовок: "1. Введение" (короткий, Title Case, нет конечной пунктуации)
+        numbered_list_pattern = r'^\d+\.\s+[А-ЯЁA-Z][^.!?]*[.!?]'  # Есть конечная пунктуация
+        if re.match(numbered_list_pattern, text):
+            return False
+
+        # Если нумерованный И длинный (>80 символов) → вероятно элемент списка
+        if re.match(r'^\d+\.\s', text) and len(text) > 80:
+            return False
+
+        # Нумерованный заголовок (короткий, без конечной пунктуации)
+        # Например: "1. Введение", "2. Основные понятия"
+        if re.match(r'^\d+[\.\)]\s', text) and len(text) < 50 and not text.endswith('.'):
+            return True
+
         # Короткая строка, начинается с заглавной
-        if len(text) < 100 and text[0].isupper():
-            # Нумерованный заголовок
-            if re.match(r'^\d+[\.\)]\s', text):
-                return True
+        if len(text) < 100 and len(text) > 0 and text[0].isupper():
             # Все заглавные
             if text.isupper() and len(text) > 3:
                 return True
@@ -555,7 +690,56 @@ class PDFParser:
         # Удаляем висячие дефисы (переносы слов)
         text = re.sub(r'-\n', '', text)
         return text.strip()
-    
+
+    def _is_garbage_line(self, line: str) -> bool:
+        """
+        Идентифицирует мусорные строки (артефакты страниц, подписи к изображениям и т.д.)
+
+        Детектируемые паттерны:
+        - Чисто числовые последовательности: "5 44 3 88 66 2 77 99 1"
+        - Символьный шум: "--- ... ___"
+        - Повторяющиеся одиночные символы: "n n n n n"
+        - Некорректные Unicode последовательности
+        """
+        line = line.strip()
+
+        if len(line) < 3:
+            return False  # Слишком короткая для оценки
+
+        if len(line) > 200:
+            return False  # Вероятно, легитимный длинный текст
+
+        # Паттерн 1: Преимущественно цифры и пробелы (>70%)
+        non_alpha = sum(1 for c in line if not c.isalpha())
+        if non_alpha / len(line) > 0.7:
+            digit_count = sum(1 for c in line if c.isdigit())
+            if digit_count > len(line) * 0.5:
+                return True
+
+        # Паттерн 2: Повторяющиеся одиночные символы (n n n n)
+        tokens = line.split()
+        if len(tokens) > 5:
+            single_char_tokens = sum(1 for t in tokens if len(t) == 1)
+            if single_char_tokens / len(tokens) > 0.6:
+                return True
+
+        # Паттерн 3: Строки с большим количеством символов (---, ___, ===)
+        symbols = sum(1 for c in line if c in '-_=.~*+#')
+        if symbols / len(line) > 0.5:
+            return True
+
+        # Паттерн 4: Replacement character (проблемы с кодировкой)
+        if line.count('\ufffd') / len(line) > 0.3:
+            return True
+
+        # Паттерн 5: Нет гласных (вероятно, поврежденный текст или коды)
+        if len(line) > 10:
+            vowel_count = sum(1 for c in line.lower() if c in 'aeiouаеёиоуыэюя')
+            if vowel_count == 0:
+                return True
+
+        return False
+
     def _detect_headers(self, text: str) -> list[str]:
         """Эвристическое определение заголовков"""
         headers = []
@@ -629,7 +813,19 @@ class PDFParser:
             md_lines.append('| ' + ' | '.join(row[:len(header)]) + ' |')
 
         return '\n'.join(md_lines)
-    
+
+    def _extract_table_text(self, md_table: str) -> str:
+        """Извлекает чистый текст из markdown таблицы для сравнения"""
+        lines = md_table.split('\n')
+        text_parts = []
+        for line in lines:
+            # Пропускаем разделители
+            if line.startswith('|') and not line.strip().startswith('| ---'):
+                # Извлекаем содержимое ячеек
+                cells = [c.strip() for c in line.split('|')[1:-1]]
+                text_parts.extend(cells)
+        return ' '.join(text_parts)
+
     def _build_markdown(
         self,
         metadata: PDFMetadata,
@@ -687,6 +883,7 @@ class PDFParser:
 
             # Текст страницы
             text = page.get('text', '')
+            added_text_fragments = set()
             if text:
                 # Убираем заголовки из текста (они уже добавлены)
                 for header_info in headers:
@@ -694,11 +891,34 @@ class PDFParser:
                     text = text.replace(header_text, '', 1)
                 clean_text = text.strip()
                 if clean_text:
+                    # Сохраняем 5-словные n-граммы для проверки дублирования
+                    words = clean_text.split()
+                    for i in range(len(words) - 4):
+                        ngram = ' '.join(words[i:i+5]).lower()
+                        added_text_fragments.add(ngram)
                     md_parts.append(clean_text)
 
-            # Таблицы
+            # Таблицы с проверкой дублирования
             for table in page.get('tables', []):
                 if table:
+                    # Проверяем, не пересекается ли таблица значительно с текстом
+                    table_text = self._extract_table_text(table)
+                    table_words = table_text.split()
+
+                    overlap_count = 0
+                    if len(table_words) > 4:
+                        for i in range(len(table_words) - 4):
+                            ngram = ' '.join(table_words[i:i+5]).lower()
+                            if ngram in added_text_fragments:
+                                overlap_count += 1
+
+                        overlap_ratio = overlap_count / max(len(table_words) - 4, 1)
+                        if overlap_ratio > 0.3:  # 30% порог перекрытия
+                            self._warnings.append(
+                                f"Skipped duplicate table on page {page_num} ({overlap_ratio:.0%} overlap)"
+                            )
+                            continue
+
                     md_parts.append(f"\n{table}\n")
 
             # Изображения для этой страницы
@@ -959,10 +1179,13 @@ def parse_pdf_to_markdown(
     pdf_path: str,
     chunk_size: int = 1500,
     chunk_overlap: int = 200,
+    detect_headers: bool = True,
     enable_ocr: bool = False,
     ocr_languages: str = 'rus+eng',
     analyze_images: bool = False,
-    vision_api_key: str = None
+    vision_api_key: str = None,
+    extract_tables: bool = True,
+    vision_focus: str = None
 ) -> ParsedDocument:
     """
     Удобная функция для парсинга PDF
@@ -971,10 +1194,13 @@ def parse_pdf_to_markdown(
         pdf_path: Путь к PDF файлу
         chunk_size: Размер чанка в символах
         chunk_overlap: Перекрытие между чанками
+        detect_headers: Определять заголовки
         enable_ocr: Включить OCR для сканированных документов
         ocr_languages: Языки для OCR (например, 'rus+eng')
         analyze_images: Анализировать изображения через Vision AI
         vision_api_key: API ключ для Vision AI (OpenAI)
+        extract_tables: Извлекать таблицы (False для художественной литературы)
+        vision_focus: Фокус анализа изображений ('formulas' или 'diagrams')
 
     Returns:
         ParsedDocument с полным markdown и чанками
@@ -982,10 +1208,13 @@ def parse_pdf_to_markdown(
     parser = PDFParser(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
+        detect_headers=detect_headers,
         enable_ocr=enable_ocr,
         ocr_languages=ocr_languages,
         analyze_images=analyze_images,
-        vision_api_key=vision_api_key
+        vision_api_key=vision_api_key,
+        extract_tables=extract_tables,
+        vision_focus=vision_focus
     )
     return parser.parse(pdf_path)
 

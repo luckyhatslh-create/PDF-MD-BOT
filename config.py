@@ -46,3 +46,65 @@ class Config:
 
 
 config = Config()
+
+
+# Профили обработки документов
+PROCESSING_PROFILES = {
+    "fiction": {
+        "name": "📖 Художественная литература",
+        "description": "Текст без таблиц и изображений",
+        "chunk_size": 2000,
+        "chunk_overlap": 300,
+        "detect_headers": True,
+        "enable_ocr": True,
+        "ocr_languages": "rus+eng",
+        "analyze_images": False,
+        "extract_tables": False,  # Отключение таблиц для художественной литературы
+    },
+    "technical": {
+        "name": "🔬 Техническая литература",
+        "description": "Формулы, таблицы, схемы",
+        "chunk_size": 1500,
+        "chunk_overlap": 200,
+        "detect_headers": True,
+        "enable_ocr": True,
+        "ocr_languages": "rus+eng",
+        "analyze_images": True,
+        "extract_tables": True,
+        "vision_focus": "formulas",  # Фокус Vision AI на формулах
+    },
+    "diagrams": {
+        "name": "📐 Схемы и чертежи",
+        "description": "Описание схем, диаграмм",
+        "chunk_size": 1000,
+        "chunk_overlap": 100,
+        "detect_headers": False,
+        "enable_ocr": True,
+        "ocr_languages": "rus+eng",
+        "analyze_images": True,
+        "extract_tables": False,
+        "vision_focus": "diagrams",  # Фокус на схемах и диаграммах
+    },
+    "universal": {
+        "name": "⚙️ Универсальный",
+        "description": "Сбалансированная обработка",
+        "chunk_size": 1500,
+        "chunk_overlap": 200,
+        "detect_headers": True,
+        "enable_ocr": False,
+        "ocr_languages": "rus+eng",
+        "analyze_images": False,
+        "extract_tables": True,
+    }
+}
+
+DEFAULT_PROFILE = "universal"
+
+# Keepalive настройки для предотвращения паузы Supabase Free Tier
+KEEPALIVE_INTERVAL_DAYS: int = int(os.getenv("KEEPALIVE_INTERVAL_DAYS", "3"))
+KEEPALIVE_ADMIN_USER_ID: Optional[int] = (
+    int(os.getenv("KEEPALIVE_ADMIN_USER_ID"))
+    if os.getenv("KEEPALIVE_ADMIN_USER_ID")
+    else None
+)
+KEEPALIVE_LOG_FILE: str = os.getenv("KEEPALIVE_LOG_FILE", "keepalive.log")

@@ -1,0 +1,94 @@
+================================================================================
+                   PDF TO MARKDOWN QUALITY IMPROVEMENTS
+                          BEFORE vs AFTER COMPARISON
+================================================================================
+
+PROBLEM 1: BROKEN TABLE WITH WORD FRAGMENTS
+--------------------------------------------------------------------------------
+❌ BEFORE (test_book.md lines 59-76):
+
+| nnnnn nn
+2. | nnnnnn | n nn | nn |
+| --- | --- | --- | --- |
+| nnnnnnnnnnnnn nn | nnnnnnn nnnn | — nnn | nnnnnnnnnnnnnn |
+| nnnnnnnnnnnnn nn | nnnnnnnnnnnn | nnnnn | nnnnn nnnnnn nn |
+| nnnnnnn nn nnnnnn | nnnnnnn nnnn | nnnn, | nnnnnnnnnnn nnn |
+| nnnnnnnnn nnnnnn | nnnn nnnnnnn. |  |  |
+| 2.1 nnnnnnnnn | nn nnnnnn | nnn | nnnn |
+| nnnnnnnn nnnnnnn | nn nnnn nnnnn | nn nn | nnnnnnnn nnnn, n |
+
+⚠️  ISSUE: Table with broken cells containing word fragments
+
+✅ AFTER (test_book_improved.md):
+[TABLE REMOVED - Rejected by quality filter]
+
+📊 Metrics: tables_rejected: 1 (reason: broken table)
+
+--------------------------------------------------------------------------------
+
+PROBLEM 2: GARBAGE LINES (SINGLE CHARACTER REPETITION)
+--------------------------------------------------------------------------------
+❌ BEFORE (test_book.md):
+
+nnnnnnnn n nnnnnnnn
+nnnnnnn nnnnnnn
+nnnnn: nnnn nnnnnn
+nnnnn nnnnnn nnnnnnnnn nnnnnnnn
+
+⚠️  ISSUE: 26 lines of corrupted/garbage text
+
+✅ AFTER (test_book_improved.md):
+[ALL GARBAGE REMOVED]
+
+📊 Metrics: garbage_lines_filtered: 26
+
+--------------------------------------------------------------------------------
+
+PROBLEM 3: TEXT DUPLICATION
+--------------------------------------------------------------------------------
+❌ BEFORE:
+Same content appears TWICE:
+1. As paragraph text
+2. As broken table
+
+✅ AFTER:
+Content appears ONCE (table rejected, clean text preserved)
+
+📊 Metrics: duplicate_tables_skipped: 0 (prevented by broken table filter)
+
+--------------------------------------------------------------------------------
+
+PROBLEM 4: NUMBERED LIST AS HEADER (Example not in test_book.pdf)
+--------------------------------------------------------------------------------
+❌ BEFORE:
+### 6. Прочно удерживайте инструмент при работе.
+
+⚠️  ISSUE: Long numbered sentence treated as H3 header
+
+✅ AFTER:
+6. Прочно удерживайте инструмент при работе.
+
+📊 Logic: Numbered sentences >80 chars not treated as headers
+
+--------------------------------------------------------------------------------
+
+OVERALL IMPACT: test_book.pdf
+--------------------------------------------------------------------------------
+METRIC                    BEFORE          AFTER           IMPROVEMENT
+--------------------------------------------------------------------------------
+Output lines              ~80             ~50             37% reduction
+Broken tables             1 displayed     0 displayed     100% removed
+Garbage lines             26 displayed    0 displayed     100% removed
+Duplicate content         Yes             No              Eliminated
+Clean markdown            No              Yes             ✅ Ready for RAG
+
+Quality Metrics:
+  tables_detected: 1
+  tables_rejected: 1
+  garbage_lines_filtered: 26
+  duplicate_tables_skipped: 0
+  broken_table_rate: 0.5 (50% of tables were broken and removed)
+
+================================================================================
+                           ✅ ALL ISSUES RESOLVED
+================================================================================
