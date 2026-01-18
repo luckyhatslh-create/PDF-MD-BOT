@@ -51,19 +51,19 @@ config = Config()
 # Профили обработки документов
 PROCESSING_PROFILES = {
     "fiction": {
-        "name": "📖 Художественная литература",
-        "description": "Текст без таблиц и изображений",
+        "name": "📖 Худ. литература",
+        "description": "Только текст",
         "chunk_size": 2000,
         "chunk_overlap": 300,
         "detect_headers": True,
         "enable_ocr": True,
         "ocr_languages": "rus+eng",
         "analyze_images": False,
-        "extract_tables": False,  # Отключение таблиц для художественной литературы
+        "extract_tables": False,
     },
-    "technical": {
-        "name": "🔬 Техническая литература",
-        "description": "Формулы, таблицы, схемы",
+    "tech_docs": {
+        "name": "📄 Тех. документация",
+        "description": "Таблицы + формулы",
         "chunk_size": 1500,
         "chunk_overlap": 200,
         "detect_headers": True,
@@ -71,11 +71,23 @@ PROCESSING_PROFILES = {
         "ocr_languages": "rus+eng",
         "analyze_images": True,
         "extract_tables": True,
-        "vision_focus": "formulas",  # Фокус Vision AI на формулах
+        "vision_focus": "formulas",
+    },
+    "tech_literature": {
+        "name": "🔬 Тех. литература",
+        "description": "Таблицы + схемы",
+        "chunk_size": 1500,
+        "chunk_overlap": 200,
+        "detect_headers": True,
+        "enable_ocr": True,
+        "ocr_languages": "rus+eng",
+        "analyze_images": True,
+        "extract_tables": True,
+        "vision_focus": "all",
     },
     "diagrams": {
-        "name": "📐 Схемы и чертежи",
-        "description": "Описание схем, диаграмм",
+        "name": "📐 Чертежи",
+        "description": "Описание схем",
         "chunk_size": 1000,
         "chunk_overlap": 100,
         "detect_headers": False,
@@ -83,11 +95,11 @@ PROCESSING_PROFILES = {
         "ocr_languages": "rus+eng",
         "analyze_images": True,
         "extract_tables": False,
-        "vision_focus": "diagrams",  # Фокус на схемах и диаграммах
+        "vision_focus": "diagrams",
     },
     "universal": {
         "name": "⚙️ Универсальный",
-        "description": "Сбалансированная обработка",
+        "description": "Сбалансированный",
         "chunk_size": 1500,
         "chunk_overlap": 200,
         "detect_headers": True,

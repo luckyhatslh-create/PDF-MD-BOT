@@ -473,7 +473,24 @@ class SupabaseManager:
         result = self.client.table('documents').select(
             'id, title, author, page_count, created_at'
         ).order('created_at', desc=True).limit(limit).execute()
-        
+
+        return result.data
+
+    def list_user_documents(self, user_id: int = None, limit: int = 50) -> list[dict]:
+        """
+        Список документов пользователя (простой запрос без RPC)
+        Если user_id указан - показывает документы пользователя + документы без user_id
+        Если user_id не указан - показывает все документы
+        """
+        query = self.client.table('documents').select(
+            'id, title, user_custom_title, author, page_count, processing_profile, '
+            'created_at, updated_at, tags, user_id'
+        ).order('created_at', desc=True).limit(limit)
+
+        # Не фильтруем строго по user_id - показываем все документы
+        # (для обратной совместимости со старыми документами без user_id)
+        result = query.execute()
+
         return result.data
     
     def delete_document(self, document_id: str) -> bool:
@@ -495,6 +512,18 @@ class SupabaseManager:
             return True
         except Exception as e:
             print(f"Ошибка переименования: {e}")
+            return False
+
+    def update_document_tags(self, document_id: str, tags: list) -> bool:
+        """Обновление тегов документа"""
+        try:
+            self.client.table('documents').update({
+                'tags': tags,
+                'updated_at': datetime.now().isoformat()
+            }).eq('id', document_id).execute()
+            return True
+        except Exception as e:
+            print(f"Ошибка обновления тегов: {e}")
             return False
 
     def search_user_documents(
